@@ -1,10 +1,14 @@
 import { useState, useEffect, createContext, useContext } from 'react';
 import { 
   LayoutDashboard, Receipt, Wallet, Settings, Plus, 
-  ArrowDownRight, Landmark, PieChart,
-  LogOut, Menu, X, AlertCircle,
+  ArrowDownRight, Landmark, PieChart, BarChart3,
+  LogOut, Menu, X, AlertCircle, Pencil, Repeat, Search,
   Smartphone, TrendingUp, Download, Trash2
 } from 'lucide-react';
+import {
+  BarChart, Bar, LineChart, Line, PieChart as RePieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts';
 
 // We use a mock configuration for the preview environment. 
 // In a real deployed app (Vercel/Netlify), you would replace these with your actual Firebase/Supabase credentials.
@@ -62,6 +66,19 @@ const formatCurrency = (amount, currency = 'USD') => {
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
+// Turns an email into a stable, storage-safe key so each local account gets its own data bucket.
+const makeUid = (email) => 'u_' + btoa(unescape(encodeURIComponent(email.trim().toLowerCase()))).replace(/[^a-zA-Z0-9]/g, '');
+
+const FREQUENCY_DAYS = { weekly: 7, monthly: 30, yearly: 365 };
+
+const advanceDate = (isoDate, frequency) => {
+  const d = new Date(isoDate);
+  if (frequency === 'monthly') d.setMonth(d.getMonth() + 1);
+  else if (frequency === 'yearly') d.setFullYear(d.getFullYear() + 1);
+  else d.setDate(d.getDate() + (FREQUENCY_DAYS[frequency] || 7));
+  return d.toISOString();
+};
+
 const FinanceContext = createContext(null);
 
 const useFinanceData = () => {
@@ -72,42 +89,67 @@ const useFinanceData = () => {
 
 const FinanceProvider = ({ children }) => {
   const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(useCloudSync);
-  
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [accounts, setAccounts] = useState([]);
   const [transactions, setTransactions] = useState([]);
-  const [settings, setSettings] = useState({ 
-    monthlySalary: 5000, 
-    currency: 'USD' 
+  const [recurringTemplates, setRecurringTemplates] = useState([]);
+  const [settings, setSettings] = useState({
+    monthlySalary: 5000,
+    currency: 'USD'
   });
   const [dataLoaded, setDataLoaded] = useState(false);
 
-  // Load initial local data if not using cloud sync
+  // On first load (local/no-sync mode): restore whichever session was last active, per-browser.
   useEffect(() => {
     if (!useCloudSync) {
-      const savedAccounts = localStorage.getItem('fos_accounts');
-      const savedTxns = localStorage.getItem('fos_transactions');
-      const savedSettings = localStorage.getItem('fos_settings');
-      
-      if (savedAccounts) setAccounts(JSON.parse(savedAccounts));
-      else setAccounts([{ id: 'acc_1', name: 'Main Bank', type: 'Bank', balance: 0 }]);
-      
-      if (savedTxns) setTransactions(JSON.parse(savedTxns));
-      if (savedSettings) setSettings(JSON.parse(savedSettings));
-      
-      setDataLoaded(true);
+      const savedUser = localStorage.getItem('fos_user');
+      if (savedUser) setUser(JSON.parse(savedUser));
       setAuthLoading(false);
     }
   }, []);
 
-  // Save to local storage whenever data changes (Fallback)
+  // Whenever the active user changes, load THAT user's own data bucket (per-user storage keys).
   useEffect(() => {
-    if (!useCloudSync && dataLoaded) {
-      localStorage.setItem('fos_accounts', JSON.stringify(accounts));
-      localStorage.setItem('fos_transactions', JSON.stringify(transactions));
-      localStorage.setItem('fos_settings', JSON.stringify(settings));
+    if (useCloudSync) return;
+    if (!user) {
+      setAccounts([]);
+      setTransactions([]);
+      setRecurringTemplates([]);
+      setDataLoaded(false);
+      return;
     }
-  }, [accounts, transactions, settings, dataLoaded]);
+    const uid = user.uid;
+    const savedAccounts = localStorage.getItem(`fos_accounts_${uid}`);
+    const savedTxns = localStorage.getItem(`fos_transactions_${uid}`);
+    const savedSettings = localStorage.getItem(`fos_settings_${uid}`);
+    const savedRecurring = localStorage.getItem(`fos_recurring_${uid}`);
+
+    setAccounts(savedAccounts ? JSON.parse(savedAccounts) : [{ id: 'acc_1', name: 'Main Bank', type: 'Bank', balance: 0 }]);
+    setTransactions(savedTxns ? JSON.parse(savedTxns) : []);
+    setSettings(savedSettings ? JSON.parse(savedSettings) : { monthlySalary: 5000, currency: 'USD' });
+    setRecurringTemplates(savedRecurring ? JSON.parse(savedRecurring) : []);
+    setDataLoaded(true);
+  }, [user?.uid]);
+
+  // Save to this user's local storage bucket whenever their data changes.
+  useEffect(() => {
+    if (!useCloudSync && dataLoaded && user) {
+      const uid = user.uid;
+      localStorage.setItem(`fos_accounts_${uid}`, JSON.stringify(accounts));
+      localStorage.setItem(`fos_transactions_${uid}`, JSON.stringify(transactions));
+      localStorage.setItem(`fos_settings_${uid}`, JSON.stringify(settings));
+      localStorage.setItem(`fos_recurring_${uid}`, JSON.stringify(recurringTemplates));
+    }
+  }, [accounts, transactions, settings, recurringTemplates, dataLoaded, user]);
+
+  // Persist the logged-in session itself (local/no-sync mode) so a refresh doesn't log them out.
+  useEffect(() => {
+    if (!useCloudSync) {
+      if (user) localStorage.setItem('fos_user', JSON.stringify(user));
+      else localStorage.removeItem('fos_user');
+    }
+  }, [user]);
 
   // Auth & Cloud Sync (If configured)
   useEffect(() => {
@@ -124,6 +166,48 @@ const FinanceProvider = ({ children }) => {
     }
   }, []);
 
+  // Auto-generate any recurring transactions that have come due (rent, subscriptions, etc.)
+  useEffect(() => {
+    if (!dataLoaded || recurringTemplates.length === 0) return;
+    const now = new Date();
+    let dueFound = false;
+
+    const updatedTemplates = recurringTemplates.map(t => t);
+    const newTxns = [];
+    const balanceDeltas = {};
+
+    recurringTemplates.forEach((tpl, idx) => {
+      let nextDue = new Date(tpl.nextDueDate);
+      let safety = 0;
+      while (nextDue <= now && safety < 24) {
+        dueFound = true;
+        const txn = {
+          id: generateId(),
+          amount: tpl.amount,
+          merchant: tpl.merchant,
+          category: tpl.category,
+          type: tpl.type,
+          accountId: tpl.accountId,
+          date: nextDue.toISOString(),
+          recurringId: tpl.id
+        };
+        newTxns.push(txn);
+        balanceDeltas[tpl.accountId] = (balanceDeltas[tpl.accountId] || 0) + (tpl.type === 'expense' ? -tpl.amount : tpl.amount);
+        nextDue = new Date(advanceDate(nextDue.toISOString(), tpl.frequency));
+        safety++;
+      }
+      updatedTemplates[idx] = { ...tpl, nextDueDate: nextDue.toISOString() };
+    });
+
+    if (dueFound) {
+      setTransactions(prev => [...newTxns, ...prev]);
+      setAccounts(prev => prev.map(acc => balanceDeltas[acc.id] ? { ...acc, balance: acc.balance + balanceDeltas[acc.id] } : acc));
+      setRecurringTemplates(updatedTemplates);
+    }
+    // Only re-check when a new user's data loads; per-session is enough for this local demo app.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataLoaded]);
+
   const addTransaction = (txn) => {
     const newTxn = { ...txn, id: generateId(), date: new Date().toISOString() };
     setTransactions(prev => [newTxn, ...prev]);
@@ -138,6 +222,28 @@ const FinanceProvider = ({ children }) => {
       }
       return acc;
     }));
+  };
+
+  const editTransaction = (id, updates) => {
+    setTransactions(prev => {
+      const oldTxn = prev.find(t => t.id === id);
+      if (!oldTxn) return prev;
+      const newTxn = { ...oldTxn, ...updates, amount: Number(updates.amount ?? oldTxn.amount) };
+
+      // Reverse the old transaction's effect, then apply the new one (handles account/amount/type changes).
+      setAccounts(accPrev => accPrev.map(acc => {
+        let balance = acc.balance;
+        if (acc.id === oldTxn.accountId) {
+          balance += oldTxn.type === 'expense' ? oldTxn.amount : -oldTxn.amount;
+        }
+        if (acc.id === newTxn.accountId) {
+          balance += newTxn.type === 'expense' ? -newTxn.amount : newTxn.amount;
+        }
+        return balance !== acc.balance ? { ...acc, balance } : acc;
+      }));
+
+      return prev.map(t => t.id === id ? newTxn : t);
+    });
   };
 
   const deleteTransaction = (id) => {
@@ -169,11 +275,33 @@ const FinanceProvider = ({ children }) => {
     setTransactions(prev => prev.filter(txn => txn.accountId !== id));
   };
 
+  const addRecurring = (tpl) => {
+    const startDate = tpl.startDate ? new Date(tpl.startDate).toISOString() : new Date().toISOString();
+    setRecurringTemplates(prev => [...prev, {
+      id: generateId(),
+      merchant: tpl.merchant,
+      amount: Number(tpl.amount),
+      category: tpl.category,
+      type: tpl.type,
+      accountId: tpl.accountId,
+      frequency: tpl.frequency,
+      nextDueDate: startDate
+    }]);
+  };
+
+  const deleteRecurring = (id) => {
+    setRecurringTemplates(prev => prev.filter(t => t.id !== id));
+  };
+
   const login = async (email, password) => {
     if (useCloudSync && auth) {
         await signInWithEmailAndPassword(auth, email, password);
     } else {
-        setUser({ email, uid: 'local_user' });
+        const users = JSON.parse(localStorage.getItem('fos_users') || '{}');
+        const key = email.trim().toLowerCase();
+        if (!users[key]) throw new Error('No account found for that email. Try signing up instead.');
+        if (users[key] !== password) throw new Error('Incorrect password.');
+        setUser({ email: key, uid: makeUid(key) });
     }
   };
 
@@ -181,7 +309,13 @@ const FinanceProvider = ({ children }) => {
     if (useCloudSync && auth) {
         await createUserWithEmailAndPassword(auth, email, password);
     } else {
-        setUser({ email, uid: 'local_user' });
+        const users = JSON.parse(localStorage.getItem('fos_users') || '{}');
+        const key = email.trim().toLowerCase();
+        if (users[key]) throw new Error('An account with that email already exists. Try signing in instead.');
+        if (!password || password.length < 4) throw new Error('Password must be at least 4 characters.');
+        users[key] = password;
+        localStorage.setItem('fos_users', JSON.stringify(users));
+        setUser({ email: key, uid: makeUid(key) });
     }
   };
 
@@ -194,15 +328,16 @@ const FinanceProvider = ({ children }) => {
   };
 
   const loginAsGuest = () => {
-      setUser({ email: 'Guest (Local)', uid: 'local_user' });
+      setUser({ email: 'Guest (Local)', uid: 'guest_local' });
   };
 
   return (
     <FinanceContext.Provider value={{ 
       user, authLoading, login, signup, logout, loginAsGuest,
-      accounts, transactions, settings, 
-      addTransaction, deleteTransaction, 
+      accounts, transactions, settings, recurringTemplates,
+      addTransaction, editTransaction, deleteTransaction, 
       addAccount, deleteAccount, 
+      addRecurring, deleteRecurring,
       setSettings 
     }}>
       {children}
@@ -498,25 +633,60 @@ const AccountsView = () => {
   );
 };
 
-const TransactionsView = () => {
-  const { transactions, accounts, addTransaction, deleteTransaction, settings } = useFinanceData();
-  const [isAdding, setIsAdding] = useState(false);
-  const [newTxn, setNewTxn] = useState({ amount: '', merchant: '', category: 'Essentials', type: 'expense', accountId: '' });
+const EMPTY_TXN = { amount: '', merchant: '', category: 'Essentials', type: 'expense', accountId: '' };
 
-  const handleAdd = (e) => {
-    e.preventDefault();
-    if (!newTxn.amount || !newTxn.merchant || !newTxn.accountId) return;
-    addTransaction({ ...newTxn, amount: Number(newTxn.amount) });
-    setNewTxn({ amount: '', merchant: '', category: 'Essentials', type: 'expense', accountId: accounts[0]?.id || '' });
-    setIsAdding(false);
+const TransactionsView = () => {
+  const { transactions, accounts, addTransaction, editTransaction, deleteTransaction, settings } = useFinanceData();
+  const [isAdding, setIsAdding] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [formTxn, setFormTxn] = useState(EMPTY_TXN);
+
+  const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('All');
+  const [typeFilter, setTypeFilter] = useState('All');
+
+  const startAdd = () => {
+    setEditingId(null);
+    setFormTxn({ ...EMPTY_TXN, accountId: accounts[0]?.id || '' });
+    setIsAdding(true);
   };
+
+  const startEdit = (txn) => {
+    setIsAdding(true);
+    setEditingId(txn.id);
+    setFormTxn({ amount: txn.amount, merchant: txn.merchant, category: txn.category, type: txn.type, accountId: txn.accountId });
+  };
+
+  const cancelForm = () => {
+    setIsAdding(false);
+    setEditingId(null);
+    setFormTxn(EMPTY_TXN);
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!formTxn.amount || !formTxn.merchant || !formTxn.accountId) return;
+    if (editingId) {
+      editTransaction(editingId, { ...formTxn, amount: Number(formTxn.amount) });
+    } else {
+      addTransaction({ ...formTxn, amount: Number(formTxn.amount) });
+    }
+    cancelForm();
+  };
+
+  const filteredTransactions = transactions.filter(txn => {
+    const matchesSearch = txn.merchant.toLowerCase().includes(search.toLowerCase());
+    const matchesCategory = categoryFilter === 'All' || txn.category === categoryFilter;
+    const matchesType = typeFilter === 'All' || txn.type === typeFilter;
+    return matchesSearch && matchesCategory && matchesType;
+  });
 
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <h2 className="text-2xl font-bold text-white">Transactions</h2>
         <button 
-          onClick={() => setIsAdding(!isAdding)}
+          onClick={() => isAdding ? cancelForm() : startAdd()}
           className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
         >
           {isAdding ? <X className="w-4 h-4"/> : <Plus className="w-4 h-4"/>}
@@ -525,12 +695,12 @@ const TransactionsView = () => {
       </div>
 
       {isAdding && (
-        <form onSubmit={handleAdd} className="bg-[#151B23] p-5 rounded-xl border border-[#252D39] grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4 items-end">
+        <form onSubmit={handleSubmit} className="bg-[#151B23] p-5 rounded-xl border border-[#252D39] grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4 items-end">
            <div className="lg:col-span-1">
             <label className="block text-xs text-gray-400 mb-1">Type</label>
             <select 
-              value={newTxn.type} 
-              onChange={e => setNewTxn({...newTxn, type: e.target.value})}
+              value={formTxn.type} 
+              onChange={e => setFormTxn({...formTxn, type: e.target.value})}
               className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white"
             >
               <option value="expense">Expense (-)</option>
@@ -541,8 +711,8 @@ const TransactionsView = () => {
             <label className="block text-xs text-gray-400 mb-1">Amount</label>
             <input 
               type="number" 
-              value={newTxn.amount} 
-              onChange={e => setNewTxn({...newTxn, amount: e.target.value})}
+              value={formTxn.amount} 
+              onChange={e => setFormTxn({...formTxn, amount: e.target.value})}
               className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white" 
               placeholder="0.00"
               required
@@ -552,8 +722,8 @@ const TransactionsView = () => {
             <label className="block text-xs text-gray-400 mb-1">Merchant</label>
             <input 
               type="text" 
-              value={newTxn.merchant} 
-              onChange={e => setNewTxn({...newTxn, merchant: e.target.value})}
+              value={formTxn.merchant} 
+              onChange={e => setFormTxn({...formTxn, merchant: e.target.value})}
               className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white" 
               placeholder="e.g. Amazon"
               required
@@ -562,8 +732,8 @@ const TransactionsView = () => {
           <div className="lg:col-span-1">
             <label className="block text-xs text-gray-400 mb-1">Category (50/30/20)</label>
             <select 
-              value={newTxn.category} 
-              onChange={e => setNewTxn({...newTxn, category: e.target.value})}
+              value={formTxn.category} 
+              onChange={e => setFormTxn({...formTxn, category: e.target.value})}
               className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white"
             >
               <option value="Essentials">Essentials (Needs)</option>
@@ -575,8 +745,8 @@ const TransactionsView = () => {
           <div className="lg:col-span-1">
             <label className="block text-xs text-gray-400 mb-1">Account</label>
             <select 
-              value={newTxn.accountId} 
-              onChange={e => setNewTxn({...newTxn, accountId: e.target.value})}
+              value={formTxn.accountId} 
+              onChange={e => setFormTxn({...formTxn, accountId: e.target.value})}
               className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white"
               required
             >
@@ -585,10 +755,44 @@ const TransactionsView = () => {
             </select>
           </div>
           <button type="submit" className="bg-blue-600 text-white p-2.5 rounded-lg font-medium hover:bg-blue-700 w-full h-[42px] lg:col-span-1">
-            Add
+            {editingId ? 'Save Changes' : 'Add'}
           </button>
         </form>
       )}
+
+      {/* Search & Filters */}
+      <div className="flex flex-col md:flex-row gap-3">
+        <div className="relative flex-1">
+          <Search className="w-4 h-4 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search by merchant..."
+            className="w-full bg-[#151B23] border border-[#252D39] rounded-lg p-2.5 pl-9 text-white text-sm focus:border-blue-500 focus:outline-none"
+          />
+        </div>
+        <select 
+          value={categoryFilter} 
+          onChange={e => setCategoryFilter(e.target.value)}
+          className="bg-[#151B23] border border-[#252D39] rounded-lg p-2.5 text-white text-sm"
+        >
+          <option value="All">All Categories</option>
+          <option value="Essentials">Essentials</option>
+          <option value="Wants">Wants</option>
+          <option value="Investments">Investments</option>
+          <option value="Income">Income</option>
+        </select>
+        <select 
+          value={typeFilter} 
+          onChange={e => setTypeFilter(e.target.value)}
+          className="bg-[#151B23] border border-[#252D39] rounded-lg p-2.5 text-white text-sm"
+        >
+          <option value="All">All Types</option>
+          <option value="expense">Expense</option>
+          <option value="income">Income</option>
+        </select>
+      </div>
 
       <div className="bg-[#151B23] rounded-2xl border border-[#252D39] overflow-hidden">
         <div className="overflow-x-auto">
@@ -604,13 +808,16 @@ const TransactionsView = () => {
               </tr>
             </thead>
             <tbody>
-              {transactions.map(txn => {
+              {filteredTransactions.map(txn => {
                 const acc = accounts.find(a => a.id === txn.accountId);
                 const d = new Date(txn.date);
                 return (
                   <tr key={txn.id} className="border-b border-[#252D39]/50 hover:bg-[#0B0F14] transition-colors">
                     <td className="p-4 text-sm text-gray-300">{d.toLocaleDateString()}</td>
-                    <td className="p-4 text-sm text-white font-medium">{txn.merchant}</td>
+                    <td className="p-4 text-sm text-white font-medium flex items-center gap-2">
+                      {txn.merchant}
+                      {txn.recurringId && <Repeat className="w-3.5 h-3.5 text-blue-400" title="Recurring transaction" />}
+                    </td>
                     <td className="p-4">
                       <span className="text-xs bg-[#0B0F14] text-gray-300 px-2 py-1 rounded border border-[#252D39]">
                         {txn.category}
@@ -621,14 +828,19 @@ const TransactionsView = () => {
                       {txn.type === 'expense' ? '-' : '+'}{formatCurrency(txn.amount, settings.currency)}
                     </td>
                     <td className="p-4 text-center">
-                      <button onClick={() => deleteTransaction(txn.id)} className="text-gray-500 hover:text-red-500 transition-colors">
-                        <Trash2 className="w-4 h-4 inline-block" />
-                      </button>
+                      <div className="flex items-center justify-center gap-3">
+                        <button onClick={() => startEdit(txn)} className="text-gray-500 hover:text-blue-500 transition-colors">
+                          <Pencil className="w-4 h-4 inline-block" />
+                        </button>
+                        <button onClick={() => deleteTransaction(txn.id)} className="text-gray-500 hover:text-red-500 transition-colors">
+                          <Trash2 className="w-4 h-4 inline-block" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
               })}
-              {transactions.length === 0 && (
+              {filteredTransactions.length === 0 && (
                 <tr>
                   <td colSpan="6" className="p-8 text-center text-gray-500">No transactions found.</td>
                 </tr>
@@ -636,6 +848,218 @@ const TransactionsView = () => {
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  );
+};
+
+const PIE_COLORS = ['#3B82F6', '#EC4899', '#10B981', '#22C55E', '#6B7280'];
+
+const AnalyticsView = () => {
+  const { transactions, settings } = useFinanceData();
+
+  // Last 6 months of expense totals
+  const monthlyData = (() => {
+    const buckets = {};
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+      buckets[key] = { name: key, Expenses: 0, Income: 0 };
+    }
+    transactions.forEach(t => {
+      const d = new Date(t.date);
+      const key = d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+      if (buckets[key]) {
+        if (t.type === 'expense') buckets[key].Expenses += t.amount;
+        else buckets[key].Income += t.amount;
+      }
+    });
+    return Object.values(buckets);
+  })();
+
+  // Category breakdown (expenses only, all time)
+  const categoryData = (() => {
+    const totals = {};
+    transactions.filter(t => t.type === 'expense').forEach(t => {
+      totals[t.category] = (totals[t.category] || 0) + t.amount;
+    });
+    return Object.entries(totals).map(([name, value]) => ({ name, value }));
+  })();
+
+  const hasData = transactions.length > 0;
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-2xl font-bold text-white">Analytics</h2>
+
+      <div className="bg-[#151B23] rounded-2xl border border-[#252D39] p-6">
+        <h3 className="text-lg font-semibold text-white mb-4">Income vs. Expenses (Last 6 Months)</h3>
+        {hasData ? (
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={monthlyData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#252D39" />
+              <XAxis dataKey="name" stroke="#9CA3AF" fontSize={12} />
+              <YAxis stroke="#9CA3AF" fontSize={12} />
+              <Tooltip contentStyle={{ backgroundColor: '#0B0F14', border: '1px solid #252D39', borderRadius: 8 }} labelStyle={{ color: '#fff' }} />
+              <Legend />
+              <Bar dataKey="Income" fill="#22C55E" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Expenses" fill="#EF4444" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : (
+          <p className="text-gray-500 text-center py-12">Add some transactions to see your trends.</p>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-[#151B23] rounded-2xl border border-[#252D39] p-6">
+          <h3 className="text-lg font-semibold text-white mb-4">Spending by Category</h3>
+          {categoryData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <RePieChart>
+                <Pie data={categoryData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90} label={(entry) => entry.name}>
+                  {categoryData.map((entry, i) => <Cell key={entry.name} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                </Pie>
+                <Tooltip formatter={(value) => formatCurrency(value, settings.currency)} contentStyle={{ backgroundColor: '#0B0F14', border: '1px solid #252D39', borderRadius: 8 }} />
+              </RePieChart>
+            </ResponsiveContainer>
+          ) : (
+            <p className="text-gray-500 text-center py-12">No expenses recorded yet.</p>
+          )}
+        </div>
+
+        <div className="bg-[#151B23] rounded-2xl border border-[#252D39] p-6">
+          <h3 className="text-lg font-semibold text-white mb-4">Monthly Trend Line</h3>
+          {hasData ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <LineChart data={monthlyData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#252D39" />
+                <XAxis dataKey="name" stroke="#9CA3AF" fontSize={12} />
+                <YAxis stroke="#9CA3AF" fontSize={12} />
+                <Tooltip contentStyle={{ backgroundColor: '#0B0F14', border: '1px solid #252D39', borderRadius: 8 }} labelStyle={{ color: '#fff' }} />
+                <Legend />
+                <Line type="monotone" dataKey="Expenses" stroke="#EF4444" strokeWidth={2} />
+                <Line type="monotone" dataKey="Income" stroke="#22C55E" strokeWidth={2} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <p className="text-gray-500 text-center py-12">Add some transactions to see your trends.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const RECURRING_EMPTY = { merchant: '', amount: '', category: 'Essentials', type: 'expense', accountId: '', frequency: 'monthly', startDate: '' };
+
+const RecurringView = () => {
+  const { recurringTemplates, accounts, addRecurring, deleteRecurring, settings } = useFinanceData();
+  const [isAdding, setIsAdding] = useState(false);
+  const [form, setForm] = useState(RECURRING_EMPTY);
+
+  const handleAdd = (e) => {
+    e.preventDefault();
+    if (!form.merchant || !form.amount || !form.accountId) return;
+    addRecurring(form);
+    setForm({ ...RECURRING_EMPTY, accountId: accounts[0]?.id || '' });
+    setIsAdding(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold text-white">Recurring Transactions</h2>
+        <button
+          onClick={() => { setIsAdding(!isAdding); setForm({ ...RECURRING_EMPTY, accountId: accounts[0]?.id || '' }); }}
+          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+        >
+          {isAdding ? <X className="w-4 h-4"/> : <Plus className="w-4 h-4"/>}
+          {isAdding ? 'Cancel' : 'New Recurring'}
+        </button>
+      </div>
+
+      <p className="text-sm text-gray-400">Rent, subscriptions, salary — anything that repeats. It'll auto-post as a transaction each time it's due, whenever you open the app.</p>
+
+      {isAdding && (
+        <form onSubmit={handleAdd} className="bg-[#151B23] p-5 rounded-xl border border-[#252D39] grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4 items-end">
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Type</label>
+            <select value={form.type} onChange={e => setForm({...form, type: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white">
+              <option value="expense">Expense (-)</option>
+              <option value="income">Income (+)</option>
+            </select>
+          </div>
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Amount</label>
+            <input type="number" value={form.amount} onChange={e => setForm({...form, amount: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white" placeholder="0.00" required />
+          </div>
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Merchant / Label</label>
+            <input type="text" value={form.merchant} onChange={e => setForm({...form, merchant: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white" placeholder="e.g. Rent" required />
+          </div>
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Category</label>
+            <select value={form.category} onChange={e => setForm({...form, category: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white">
+              <option value="Essentials">Essentials</option>
+              <option value="Wants">Wants</option>
+              <option value="Investments">Investments</option>
+              <option value="Income">Income</option>
+            </select>
+          </div>
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Account</label>
+            <select value={form.accountId} onChange={e => setForm({...form, accountId: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white" required>
+              <option value="" disabled>Select Account</option>
+              {accounts.map(acc => <option key={acc.id} value={acc.id}>{acc.name}</option>)}
+            </select>
+          </div>
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Repeats</label>
+            <select value={form.frequency} onChange={e => setForm({...form, frequency: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white">
+              <option value="weekly">Weekly</option>
+              <option value="monthly">Monthly</option>
+              <option value="yearly">Yearly</option>
+            </select>
+          </div>
+          <div className="lg:col-span-1">
+            <label className="block text-xs text-gray-400 mb-1">Starts On</label>
+            <input type="date" value={form.startDate} onChange={e => setForm({...form, startDate: e.target.value})} className="w-full bg-[#0B0F14] border border-[#252D39] rounded-lg p-2.5 text-white" />
+          </div>
+          <button type="submit" className="bg-blue-600 text-white p-2.5 rounded-lg font-medium hover:bg-blue-700 w-full h-[42px] lg:col-span-1">
+            Save
+          </button>
+        </form>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {recurringTemplates.map(tpl => {
+          const acc = accounts.find(a => a.id === tpl.accountId);
+          return (
+            <div key={tpl.id} className="bg-[#151B23] p-5 rounded-2xl border border-[#252D39] flex justify-between items-start">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <Repeat className="w-4 h-4 text-blue-400" />
+                  <p className="font-medium text-white">{tpl.merchant}</p>
+                </div>
+                <p className="text-sm text-gray-400 capitalize">{tpl.frequency} · {tpl.category} · {acc ? acc.name : 'Unknown account'}</p>
+                <p className="text-xs text-gray-500 mt-1">Next: {new Date(tpl.nextDueDate).toLocaleDateString()}</p>
+              </div>
+              <div className="text-right">
+                <p className={`font-semibold ${tpl.type === 'expense' ? 'text-white' : 'text-green-500'}`}>
+                  {tpl.type === 'expense' ? '-' : '+'}{formatCurrency(tpl.amount, settings.currency)}
+                </p>
+                <button onClick={() => deleteRecurring(tpl.id)} className="text-gray-500 hover:text-red-500 transition-colors mt-2">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+        {recurringTemplates.length === 0 && (
+          <p className="text-gray-500 col-span-2 text-center py-8">No recurring transactions set up yet.</p>
+        )}
       </div>
     </div>
   );
@@ -719,6 +1143,8 @@ const AppContent = () => {
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'transactions', label: 'Transactions', icon: Receipt },
+    { id: 'recurring', label: 'Recurring', icon: Repeat },
+    { id: 'analytics', label: 'Analytics', icon: BarChart3 },
     { id: 'accounts', label: 'Accounts', icon: Wallet },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
@@ -727,6 +1153,8 @@ const AppContent = () => {
     switch(activeTab) {
       case 'dashboard': return <Dashboard />;
       case 'transactions': return <TransactionsView />;
+      case 'recurring': return <RecurringView />;
+      case 'analytics': return <AnalyticsView />;
       case 'accounts': return <AccountsView />;
       case 'settings': return <SettingsView />;
       default: return <Dashboard />;
